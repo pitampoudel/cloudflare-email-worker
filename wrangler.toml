@@ -2,6 +2,10 @@ name = "email-to-slack"
 main = "worker.js"
 compatibility_date = "2026-02-06"
 
+# Environment variables (set these as secrets via dashboard or wrangler secret put)
+# SLACK_BOT_TOKEN - Your Slack bot token
+# ROUTES_JSON - JSON object mapping email addresses to Slack routes
+
 [observability]
 enabled = false
 head_sampling_rate = 1

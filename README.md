@@ -20,10 +20,12 @@ npx wrangler secret put ROUTES_JSON
 ```
 Enter your routing JSON when prompted (see example below).
 
+**Important:** Make sure to use the variable name `ROUTES_JSON` (not `ROUTES`). The worker code expects this specific variable name.
+
 Alternatively, you can set these variables in the Cloudflare dashboard:
 - Go to Workers & Pages > Your Worker > Settings > Variables
 - Add `SLACK_BOT_TOKEN` as an encrypted variable
-- Add `ROUTES_JSON` as an encrypted variable
+- Add `ROUTES_JSON` as an encrypted variable (ensure the name is exactly `ROUTES_JSON`)
 
 ### 2. Deploy
 
