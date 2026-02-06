@@ -1,0 +1,12 @@
+# Wrangler build artifacts
+.wrangler/
+dist/
+node_modules/
+
+# Environment variables (should never be committed)
+.env
+.dev.vars
+
+# OS files
+.DS_Store
+Thumbs.db

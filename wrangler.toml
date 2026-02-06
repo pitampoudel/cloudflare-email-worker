@@ -1,0 +1,16 @@
+name = "cloudflare-email-forwarder"
+main = "worker.js"
+compatibility_date = "2026-02-06"
+
+# Environment variables (set these in Cloudflare dashboard or via wrangler CLI)
+# These variables are NOT stored in this file for security reasons
+# 
+# SLACK_BOT_TOKEN: Slack bot token for API authentication (required)
+#   Set using: wrangler secret put SLACK_BOT_TOKEN
+#
+# ROUTES_JSON: JSON mapping of email addresses to Slack destinations (required)
+#   Set using: wrangler secret put ROUTES_JSON
+#   Example: {"ceo@yourcompany.com":{"type":"dm","user":"U06TDCJGP4H"},"support@yourcompany.com":{"id":"C06SXQKQC2H","type":"channel"}}
+#
+# Both variables can also be set in the Cloudflare dashboard:
+# Workers > Your Worker > Settings > Variables
