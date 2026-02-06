@@ -1,5 +1,5 @@
 ### cloudflare build command
-npx wrangler deploy worker.js --compatibility-date 2026-02-06
+npx wrangler deploy worker.js --compatibility-date 2026-02-06  --keep-vars
 
 ### ROUTES_JSON EXAMPLE
 ``
