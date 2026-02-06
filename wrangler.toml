@@ -1,4 +1,4 @@
-name = "email-to-slack"
+name = "cloudflare-to-slack"
 main = "worker.js"
 compatibility_date = "2026-02-06"
 
