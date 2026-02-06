@@ -46,20 +46,6 @@ async function handleSlackForward(message, token, rcpt, route) {
             return;
         }
 
-        // Post a ping first (no read scopes needed). If this fails, your channel route is wrong or bot isn't invited.
-        const ping = await slackJson("chat.postMessage", token, {
-            channel: targetId,
-            text: "📥 New email received — uploading .eml…",
-        });
-
-        if (!ping.ok) {
-            console.error("chat.postMessage failed", { rcpt, targetId, ping });
-            // Typical fixes:
-            // - error=not_in_channel => /invite @YourBotName into the channel
-            // - error=channel_not_found => wrong ID (you used a name or wrong workspace)
-            return;
-        }
-
         const rawBytes = await getRawEmailBytes(message);
         const length = rawBytes.byteLength;
 
