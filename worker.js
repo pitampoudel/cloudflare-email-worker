@@ -12,7 +12,7 @@ export default {
     // Decide target
     const route = routes[rcpt];
     if (!route) {
-      console.error("No route for recipient:", rcpt);
+      message.setReject(`550 5.1.1 No such recipient: ${rcpt}`);
       return;
     }
 
