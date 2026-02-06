@@ -7,7 +7,7 @@ export default {
     }
 
     const routes = safeJson(env.ROUTES_JSON, {});
-    const rcpt = getPrimaryRecipient(message); // normalized email like support@vardansoft.com
+    const rcpt = getPrimaryRecipient(message); // normalized email
 
     // Decide target
     const route = routes[rcpt];
