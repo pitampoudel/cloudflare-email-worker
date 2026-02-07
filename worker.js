@@ -9,11 +9,6 @@ import PostalMime from "postal-mime";
 
 const FALLBACK_CHANNEL_NAME = "fallback-email-inbox";
 
-// Slack / blocks constraints (keep conservative)
-const SLACK_BLOCK_TEXT_LIMIT = 3000; // Slack is ~3000 chars for mrkdwn text
-const SLACK_PREVIEW_LIMIT = 2500; // keep room for header/labels
-const SLACK_ATTACHMENTS_LIST_LIMIT = 10;
-
 const DEFAULT_OPTIONS = {
     stripPlusAddressing: false, // set true if you want user+tag@domain.com → user@domain.com
     // If true, tries to create channels by name (requires perms). If false, only resolves existing.
@@ -30,7 +25,7 @@ export default {
             }
 
             const routes = safeJson(env.ROUTES_JSON, {});
-            const options = { ...DEFAULT_OPTIONS, ...safeJson(env.OPTIONS_JSON, {}) };
+            const options = DEFAULT_OPTIONS;
 
             const rcpt = getPrimaryRecipient(message, { stripPlusAddressing: options.stripPlusAddressing });
 
@@ -75,7 +70,7 @@ async function handleSlackForward({ message, token, rcpt, route, options }) {
 
         const bodyText = extractBestText(parsed);
         const bodyPreview = bodyText
-            ? clampSlackMrkdwn(bodyText, SLACK_PREVIEW_LIMIT)
+            ? clampSlackMrkdwn(bodyText)
             : "_(No readable body found.)_";
 
         const blocks = buildSlackBlocks({
@@ -372,9 +367,9 @@ function buildSlackBlocks({ toHeader, from, subject, bodyPreview, attachments })
         {
             type: "section",
             fields: [
-                { type: "mrkdwn", text: `*From:*\n${escapeSlackMrkdwn(from)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
-                { type: "mrkdwn", text: `*To:*\n${escapeSlackMrkdwn(toHeader)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
-                { type: "mrkdwn", text: `*Subject:*\n${escapeSlackMrkdwn(subject)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
+                { type: "mrkdwn", text: `*From:*\n${escapeSlackMrkdwn(from)}` },
+                { type: "mrkdwn", text: `*To:*\n${escapeSlackMrkdwn(toHeader)}` },
+                { type: "mrkdwn", text: `*Subject:*\n${escapeSlackMrkdwn(subject)}` },
             ],
         },
         { type: "divider" },
@@ -382,14 +377,13 @@ function buildSlackBlocks({ toHeader, from, subject, bodyPreview, attachments })
             type: "section",
             text: {
                 type: "mrkdwn",
-                text: `*Preview:*\n${bodyPreview}`.slice(0, SLACK_BLOCK_TEXT_LIMIT),
+                text: bodyPreview,
             },
         },
     ];
 
     if (Array.isArray(attachments) && attachments.length) {
         const attLines = attachments
-            .slice(0, SLACK_ATTACHMENTS_LIST_LIMIT)
             .map((a, i) => `• ${i + 1}. ${a.filename || "attachment"} (${a.mimeType || "unknown"}, ${a.size ?? "?"} bytes)`)
             .join("\n");
 
@@ -398,7 +392,7 @@ function buildSlackBlocks({ toHeader, from, subject, bodyPreview, attachments })
             type: "section",
             text: {
                 type: "mrkdwn",
-                text: `*Attachments (${attachments.length}):*\n${escapeSlackMrkdwn(attLines)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT),
+                text: `*Attachments (${attachments.length}):*\n${escapeSlackMrkdwn(attLines)}`,
             },
         });
     }
@@ -515,12 +509,10 @@ async function getRawEmailBytes(message) {
 
 /* -------------------------- Text / Safety Utilities -------------------------- */
 
-function clampSlackMrkdwn(text, maxChars) {
+function clampSlackMrkdwn(text) {
     const t = (text || "").trim();
     if (!t) return "";
-    const safe = escapeSlackMrkdwn(t);
-    if (safe.length <= maxChars) return safe;
-    return safe.slice(0, Math.max(0, maxChars - 1)) + "…";
+    return escapeSlackMrkdwn(t);
 }
 
 /**
