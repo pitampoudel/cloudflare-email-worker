@@ -1,103 +1,94 @@
+/**
+ * Cloudflare Email Worker → Slack forwarder
+ * - Parses MIME with postal-mime
+ * - Posts a readable preview (blocks)
+ * - Uploads full body as .txt + optional raw .eml archive
+ */
+
 import PostalMime from "postal-mime";
 
-const FALLBACK_CHANNEL_NAME = "fallback-email-inbox"; // hardcoded catch-all
+const FALLBACK_CHANNEL_NAME = "fallback-email-inbox";
+
+// Slack / blocks constraints (keep conservative)
+const SLACK_BLOCK_TEXT_LIMIT = 3000; // Slack is ~3000 chars for mrkdwn text
+const SLACK_PREVIEW_LIMIT = 2500; // keep room for header/labels
+const SLACK_ATTACHMENTS_LIST_LIMIT = 10;
+
+const DEFAULT_OPTIONS = {
+    uploadTxtBody: true,
+    uploadRawEml: true,
+    stripPlusAddressing: false, // set true if you want user+tag@domain.com → user@domain.com
+    // If true, tries to create channels by name (requires perms). If false, only resolves existing.
+    allowCreatePublicChannels: true,
+};
 
 export default {
     async email(message, env, ctx) {
-        const token = env.SLACK_BOT_TOKEN;
-        if (!token) {
-            console.error("Missing SLACK_BOT_TOKEN");
-            return; // NEVER reject email
+        try {
+            const token = env.SLACK_BOT_TOKEN;
+            if (!token) {
+                console.error("Missing SLACK_BOT_TOKEN");
+                return; // NEVER reject email
+            }
+
+            const routes = safeJson(env.ROUTES_JSON, {});
+            const options = { ...DEFAULT_OPTIONS, ...safeJson(env.OPTIONS_JSON, {}) };
+
+            const rcpt = getPrimaryRecipient(message, { stripPlusAddressing: options.stripPlusAddressing });
+
+            const route = normalizeRoute(routes?.[rcpt]) ?? {
+                type: "channel",
+                name: FALLBACK_CHANNEL_NAME,
+            };
+
+            if (!routes?.[rcpt]) {
+                console.warn("No route found; using fallback channel", { rcpt, fallback: FALLBACK_CHANNEL_NAME });
+            }
+
+            ctx.waitUntil(handleSlackForward({ message, token, rcpt, route, options }));
+        } catch (e) {
+            // never bounce
+            console.error("Email handler crashed", e);
         }
-
-        const routes = safeJson(env.ROUTES_JSON, {});
-        const rcpt = getPrimaryRecipient(message);
-
-        let route = routes[rcpt];
-        if (!route) {
-            route = { type: "channel", name: FALLBACK_CHANNEL_NAME };
-            console.warn("No route found; using fallback channel", { rcpt, fallback: FALLBACK_CHANNEL_NAME });
-        }
-
-        ctx.waitUntil(handleSlackForward(message, token, rcpt, route));
     },
 };
 
-async function handleSlackForward(message, token, rcpt, route) {
+/**
+ * Main forward flow:
+ * 1) Resolve target channel ID
+ * 2) Parse raw email bytes with postal-mime
+ * 3) Post preview blocks
+ * 4) Upload body .txt (optional)
+ * 5) Upload raw .eml (optional)
+ */
+async function handleSlackForward({ message, token, rcpt, route, options }) {
+    const cache = new Map(); // per-request cache
     try {
-        let targetId = null;
-
-        if (route.type === "dm") {
-            targetId = await openDmChannel(token, route.user);
-            if (!targetId) {
-                console.error("Failed to open DM", { rcpt, user: route.user });
-                return;
-            }
-        } else if (route.type === "channel") {
-            targetId = await resolveChannelTarget(token, route);
-            if (!targetId) {
-                console.error(
-                    "Failed to resolve channel target. If this is a private channel, invite the bot and/or set route.id (channel ID).",
-                    { rcpt, route }
-                );
-                return;
-            }
-        } else {
-            console.error("Invalid route type:", route.type);
-            return;
-        }
+        const targetId = await resolveSlackTargetId(token, route, { cache, options });
+        if (!targetId) return;
 
         const rawBytes = await getRawEmailBytes(message);
-        const subject = message.headers.get("subject") || "no-subject";
-        const from = message.from || message.headers.get("from") || "unknown";
-        const toHeader = message.headers.get("to") || rcpt;
 
-        // ✅ Parse MIME so we can show it in Slack
-        const parsed = await new PostalMime().parse(rawBytes);
+        const subject = headerOr(message, "subject", "no-subject");
+        const from = message.from || headerOr(message, "from", "unknown");
+        const toHeader = headerOr(message, "to", rcpt);
 
-        const bodyText =
-            (parsed.text && parsed.text.trim()) ||
-            (parsed.html && htmlToText(parsed.html).trim()) ||
-            "";
+        const parsed = await safeParseMime(rawBytes);
 
-        const bodyPreview = clampSlackText(bodyText, 2800) || "_(No readable body found.)_";
+        const bodyText = extractBestText(parsed);
+        const bodyPreview = bodyText
+            ? clampSlackMrkdwn(bodyText, SLACK_PREVIEW_LIMIT)
+            : "_(No readable body found.)_";
 
-        // ✅ 1) Post an in-Slack readable message (no download required)
-        const blocks = [
-            {
-                type: "header",
-                text: { type: "plain_text", text: "📧 New email", emoji: true },
-            },
-            {
-                type: "section",
-                fields: [
-                    { type: "mrkdwn", text: `*To:*\n${escapeMrkdwn(toHeader)}` },
-                    { type: "mrkdwn", text: `*From:*\n${escapeMrkdwn(from)}` },
-                    { type: "mrkdwn", text: `*Subject:*\n${escapeMrkdwn(subject)}` },
-                ],
-            },
-            { type: "divider" },
-            {
-                type: "section",
-                text: { type: "mrkdwn", text: `*Preview:*\n${bodyPreview}` },
-            },
-        ];
+        const blocks = buildSlackBlocks({
+            toHeader,
+            from,
+            subject,
+            bodyPreview,
+            attachments: parsed?.attachments,
+        });
 
-        // include attachment summary (if any)
-        if (Array.isArray(parsed.attachments) && parsed.attachments.length) {
-            const attLines = parsed.attachments
-                .slice(0, 10)
-                .map((a, i) => `• ${i + 1}. ${a.filename || "attachment"} (${a.mimeType || "unknown"}, ${a.size || "?"} bytes)`)
-                .join("\n");
-
-            blocks.push({ type: "divider" });
-            blocks.push({
-                type: "section",
-                text: { type: "mrkdwn", text: `*Attachments (${parsed.attachments.length}):*\n${escapeMrkdwn(attLines)}` },
-            });
-        }
-
-        const postRes = await slackJson("chat.postMessage", token, {
+        const postRes = await slackApiJson(token, "chat.postMessage", {
             channel: targetId,
             text: `New email: ${subject}`, // fallback text
             blocks,
@@ -107,11 +98,11 @@ async function handleSlackForward(message, token, rcpt, route) {
 
         if (!postRes.ok) {
             console.error("chat.postMessage failed:", postRes);
-            // keep going; we can still upload files
+            // Continue; uploads can still succeed.
         }
 
-        // ✅ 2) Upload full body as .txt so Slack shows an inline preview (no download)
-        if (bodyText && bodyText.trim()) {
+        // Upload full body as .txt (optional)
+        if (options.uploadTxtBody && bodyText?.trim()) {
             const bodyFilename = `email-body-${Date.now()}.txt`;
             const bodyBytes = new TextEncoder().encode(bodyText);
 
@@ -120,12 +111,13 @@ async function handleSlackForward(message, token, rcpt, route) {
             });
         }
 
-        // ✅ 3) Optional: also upload the raw .eml as an archive
-        // If you don't want .eml at all, remove this block.
-        const emlFilename = buildFilename(subject); // ends with .eml
-        await uploadBytesToSlack(token, targetId, emlFilename, rawBytes, {
-            initial_comment: "Raw email archive (.eml):",
-        });
+        // Upload raw .eml archive (optional)
+        if (options.uploadRawEml) {
+            const emlFilename = buildEmlFilename(subject);
+            await uploadBytesToSlack(token, targetId, emlFilename, rawBytes, {
+                initial_comment: "Raw email archive (.eml):",
+            });
+        }
 
         console.log("email forwarded", { rcpt, targetId });
     } catch (e) {
@@ -133,62 +125,39 @@ async function handleSlackForward(message, token, rcpt, route) {
     }
 }
 
+/* -------------------------- Slack Target Resolution -------------------------- */
 
-async function uploadBytesToSlack(token, channelId, filename, bytes, { initial_comment } = {}) {
-    const length = bytes.byteLength;
+async function resolveSlackTargetId(token, route, { cache, options }) {
+    const type = route?.type;
 
-    const getUrlRes = await slackForm("files.getUploadURLExternal", token, {
-        filename,
-        length: String(length),
-    });
-    if (!getUrlRes.ok) {
-        console.error("files.getUploadURLExternal failed:", getUrlRes);
-        return false;
+    if (type === "dm") {
+        const userId = route.user;
+        if (!userId) {
+            console.error("DM route missing user", route);
+            return null;
+        }
+        return await openDmChannel(token, userId);
     }
 
-    const uploadRes = await fetch(getUrlRes.upload_url, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: bytes,
-    });
-    if (!uploadRes.ok) {
-        const t = await uploadRes.text().catch(() => "");
-        console.error("Upload failed:", uploadRes.status, t.slice(0, 500));
-        return false;
+    if (type === "channel") {
+        // Prefer explicit channel ID (recommended for private channels)
+        if (route.id && /^[CG][A-Z0-9]+$/.test(route.id)) return route.id;
+
+        const name = sanitizeChannelName(route.name || route.channel || route.slug || "");
+        if (!name) {
+            console.error("Channel route missing name or valid id", { route });
+            return null;
+        }
+
+        return await ensureChannelByName(token, name, { cache, allowCreate: options.allowCreatePublicChannels });
     }
 
-    const completeRes = await slackForm("files.completeUploadExternal", token, {
-        files: JSON.stringify([{ id: getUrlRes.file_id, title: filename }]),
-        channel_id: channelId,
-        ...(initial_comment ? { initial_comment } : {}),
-    });
-
-    if (!completeRes.ok) {
-        console.error("files.completeUploadExternal failed:", completeRes);
-        return false;
-    }
-
-    return true;
+    console.error("Invalid route type:", type);
+    return null;
 }
-
-// ---------- NEW: channel target resolver ----------
-
-async function resolveChannelTarget(token, route) {
-    if (route.id && /^[CG][A-Z0-9]+$/.test(route.id)) return route.id;
-
-    const name = sanitizeChannelName(route.name || route.channel || route.slug || "");
-    if (!name) {
-        console.error("Channel route missing name or valid id", { route });
-        return null;
-    }
-
-    return await ensureChannelByName(token, name);
-}
-
-// ---------- Slack helpers ----------
 
 async function openDmChannel(token, userId) {
-    const res = await slackJson("conversations.open", token, { users: userId });
+    const res = await slackApiJson(token, "conversations.open", { users: userId });
     if (!res.ok) {
         console.error("conversations.open failed:", res);
         return null;
@@ -196,23 +165,39 @@ async function openDmChannel(token, userId) {
     return res.channel?.id || null;
 }
 
-async function ensureChannelByName(token, name) {
-    const existing = await findChannelByName(token, name);
-    if (existing) return existing;
+async function ensureChannelByName(token, name, { cache, allowCreate }) {
+    const cacheKey = `channel:${name}`;
+    if (cache.has(cacheKey)) return cache.get(cacheKey);
 
-    const created = await slackJson("conversations.create", token, { name });
-    if (!created.ok) {
-        console.error("conversations.create failed (maybe restricted perms):", created);
+    const existing = await findChannelByName(token, name);
+    if (existing) {
+        cache.set(cacheKey, existing);
+        return existing;
+    }
+
+    if (!allowCreate) {
+        console.error("Channel not found and creation disabled", { name });
+        cache.set(cacheKey, null);
         return null;
     }
-    return created.channel?.id || null;
+
+    const created = await slackApiJson(token, "conversations.create", { name });
+    if (!created.ok) {
+        console.error("conversations.create failed (maybe restricted perms):", created);
+        cache.set(cacheKey, null);
+        return null;
+    }
+
+    const id = created.channel?.id || null;
+    cache.set(cacheKey, id);
+    return id;
 }
 
 async function findChannelByName(token, name) {
     let cursor;
 
     while (true) {
-        const res = await slackJson("conversations.list", token, {
+        const res = await slackApiJson(token, "conversations.list", {
             limit: 200,
             cursor,
             types: "public_channel,private_channel",
@@ -234,68 +219,335 @@ async function findChannelByName(token, name) {
     return null;
 }
 
-async function slackForm(method, token, fields) {
-    const form = new FormData();
-    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+/* -------------------------- Slack Posting / Upload --------------------------- */
 
-    const res = await fetch(`https://slack.com/api/${method}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-    });
+/**
+ * Robust Slack API JSON wrapper:
+ * - Handles non-JSON, Slack errors
+ * - Retries on rate-limit / transient errors
+ */
+async function slackApiJson(token, method, bodyObj, { retries = 2 } = {}) {
+    const url = `https://slack.com/api/${method}`;
 
-    const text = await res.text();
-    let json;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            body: JSON.stringify(bodyObj ?? {}),
+        });
+
+        // Rate-limited
+        if (res.status === 429 && attempt < retries) {
+            const retryAfter = Number(res.headers.get("retry-after") || "1");
+            await sleep(Math.min(Math.max(retryAfter, 1), 10) * 1000);
+            continue;
+        }
+
+        const text = await res.text();
+        let json;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+        }
+
+        if (!json.ok) {
+            // Retry some transient Slack errors
+            if (attempt < retries && isRetryableSlackError(json.error)) {
+                await sleep(600 * (attempt + 1));
+                continue;
+            }
+            return { ok: false, error: json.error, httpStatus: res.status, response: json };
+        }
+
+        return { ok: true, ...json };
     }
 
-    if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
-    return { ok: true, ...json };
+    return { ok: false, error: "retries_exhausted" };
 }
 
-async function slackJson(method, token, bodyObj) {
-    const res = await fetch(`https://slack.com/api/${method}`, {
+async function slackApiForm(token, method, fields, { retries = 2 } = {}) {
+    const url = `https://slack.com/api/${method}`;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const form = new FormData();
+        for (const [k, v] of Object.entries(fields)) form.append(k, v);
+
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: form,
+        });
+
+        if (res.status === 429 && attempt < retries) {
+            const retryAfter = Number(res.headers.get("retry-after") || "1");
+            await sleep(Math.min(Math.max(retryAfter, 1), 10) * 1000);
+            continue;
+        }
+
+        const text = await res.text();
+        let json;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+        }
+
+        if (!json.ok) {
+            if (attempt < retries && isRetryableSlackError(json.error)) {
+                await sleep(600 * (attempt + 1));
+                continue;
+            }
+            return { ok: false, error: json.error, httpStatus: res.status, response: json };
+        }
+
+        return { ok: true, ...json };
+    }
+
+    return { ok: false, error: "retries_exhausted" };
+}
+
+/**
+ * External upload flow:
+ * 1) files.getUploadURLExternal
+ * 2) POST bytes to upload_url
+ * 3) files.completeUploadExternal
+ */
+async function uploadBytesToSlack(token, channelId, filename, bytes, { initial_comment } = {}) {
+    const length = bytes?.byteLength ?? 0;
+    if (!length) return false;
+
+    const getUrlRes = await slackApiForm(token, "files.getUploadURLExternal", {
+        filename,
+        length: String(length),
+    });
+
+    if (!getUrlRes.ok) {
+        console.error("files.getUploadURLExternal failed:", getUrlRes);
+        return false;
+    }
+
+    const uploadRes = await fetch(getUrlRes.upload_url, {
         method: "POST",
-        headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json; charset=utf-8",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: bytes,
+    });
+
+    if (!uploadRes.ok) {
+        const t = await uploadRes.text().catch(() => "");
+        console.error("Upload failed:", uploadRes.status, t.slice(0, 500));
+        return false;
+    }
+
+    const completeRes = await slackApiForm(token, "files.completeUploadExternal", {
+        files: JSON.stringify([{ id: getUrlRes.file_id, title: filename }]),
+        channel_id: channelId,
+        ...(initial_comment ? { initial_comment } : {}),
+    });
+
+    if (!completeRes.ok) {
+        console.error("files.completeUploadExternal failed:", completeRes);
+        return false;
+    }
+
+    return true;
+}
+
+/* -------------------------- Email Parse / Blocks ----------------------------- */
+
+async function safeParseMime(rawBytes) {
+    try {
+        return await new PostalMime().parse(rawBytes);
+    } catch (e) {
+        console.error("PostalMime parse failed", e);
+        return { text: "", html: "", attachments: [] };
+    }
+}
+
+function extractBestText(parsed) {
+    const text = parsed?.text?.trim();
+    if (text) return text;
+
+    const html = parsed?.html?.trim();
+    if (html) return htmlToText(html);
+
+    return "";
+}
+
+function buildSlackBlocks({ toHeader, from, subject, bodyPreview, attachments }) {
+    const blocks = [
+        {
+            type: "header",
+            text: { type: "plain_text", text: "📧 New email", emoji: true },
         },
-        body: JSON.stringify(bodyObj ?? {}),
-    });
+        {
+            type: "section",
+            fields: [
+                { type: "mrkdwn", text: `*To:*\n${escapeSlackMrkdwn(toHeader)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
+                { type: "mrkdwn", text: `*From:*\n${escapeSlackMrkdwn(from)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
+                { type: "mrkdwn", text: `*Subject:*\n${escapeSlackMrkdwn(subject)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
+            ],
+        },
+        { type: "divider" },
+        {
+            type: "section",
+            text: {
+                type: "mrkdwn",
+                text: `*Preview:*\n${bodyPreview}`.slice(0, SLACK_BLOCK_TEXT_LIMIT),
+            },
+        },
+    ];
 
-    const text = await res.text();
-    let json;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        return { ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 500) };
+    if (Array.isArray(attachments) && attachments.length) {
+        const attLines = attachments
+            .slice(0, SLACK_ATTACHMENTS_LIST_LIMIT)
+            .map((a, i) => `• ${i + 1}. ${a.filename || "attachment"} (${a.mimeType || "unknown"}, ${a.size ?? "?"} bytes)`)
+            .join("\n");
+
+        blocks.push({ type: "divider" });
+        blocks.push({
+            type: "section",
+            text: {
+                type: "mrkdwn",
+                text: `*Attachments (${attachments.length}):*\n${escapeSlackMrkdwn(attLines)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT),
+            },
+        });
     }
 
-    if (!json.ok) return { ok: false, error: json.error, httpStatus: res.status, response: json };
-    return { ok: true, ...json };
+    return blocks;
 }
 
-// ---------- routing helpers ----------
+/* -------------------------- Routing / Config -------------------------------- */
 
-function getPrimaryRecipient(message) {
-    const to = message.to;
-    const raw = Array.isArray(to) ? to[0] : to;
+function normalizeRoute(route) {
+    if (!route || typeof route !== "object") return null;
 
-    if (typeof raw === "string") {
-        const m = raw.match(/([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
-        if (m) return m[1].toLowerCase();
+    const type = String(route.type || "").toLowerCase();
+    if (type === "dm") {
+        return route.user ? { type: "dm", user: String(route.user) } : null;
     }
 
-    const h = message.headers?.get?.("to");
-    if (h) {
-        const m = h.match(/([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
-        if (m) return m[1].toLowerCase();
+    if (type === "channel") {
+        return {
+            type: "channel",
+            id: route.id ? String(route.id) : undefined,
+            name: route.name || route.channel || route.slug ? String(route.name || route.channel || route.slug) : undefined,
+        };
     }
 
-    return "unknown@unknown";
+    return null;
+}
+
+function safeJson(str, fallback) {
+    try {
+        return str ? JSON.parse(str) : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+/* -------------------------- Headers / Recipient ------------------------------ */
+
+function headerOr(message, headerName, fallback) {
+    const v = message?.headers?.get?.(headerName);
+    return v || fallback;
+}
+
+/**
+ * Picks a primary recipient.
+ * - Uses message.to first
+ * - Falls back to To header
+ * - Optionally strips plus addressing
+ */
+function getPrimaryRecipient(message, { stripPlusAddressing } = {}) {
+    const all = [];
+
+    // message.to can be string or array; Cloudflare Email Workers vary
+    const to = message?.to;
+    if (Array.isArray(to)) all.push(...to);
+    else if (to) all.push(to);
+
+    const toHeader = message?.headers?.get?.("to");
+    if (toHeader) all.push(toHeader);
+
+    const found = extractFirstEmail(all.join(", "));
+    if (!found) return "unknown@unknown";
+
+    return (stripPlusAddressing ? stripPlus(found) : found).toLowerCase();
+}
+
+function extractFirstEmail(s) {
+    const m = String(s || "").match(/([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
+    return m ? m[1] : null;
+}
+
+function stripPlus(email) {
+    // user+tag@domain.com -> user@domain.com
+    const m = String(email).match(/^([^@+]+)(?:\+[^@]+)?@(.+)$/);
+    return m ? `${m[1]}@${m[2]}` : email;
+}
+
+/* -------------------------- Raw Email Bytes ---------------------------------- */
+
+async function getRawEmailBytes(message) {
+    const raw = message?.raw;
+
+    if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+
+    // ReadableStream
+    if (raw && typeof raw.getReader === "function") {
+        const reader = raw.getReader();
+        const chunks = [];
+        let total = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            total += value.byteLength;
+        }
+
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (const c of chunks) {
+            out.set(c, offset);
+            offset += c.byteLength;
+        }
+        return out;
+    }
+
+    if (typeof raw === "string") return new TextEncoder().encode(raw);
+
+    // Fallback
+    const ab = await new Response(raw).arrayBuffer();
+    return new Uint8Array(ab);
+}
+
+/* -------------------------- Text / Safety Utilities -------------------------- */
+
+function clampSlackMrkdwn(text, maxChars) {
+    const t = (text || "").trim();
+    if (!t) return "";
+    const safe = escapeSlackMrkdwn(t);
+    if (safe.length <= maxChars) return safe;
+    return safe.slice(0, Math.max(0, maxChars - 1)) + "…";
+}
+
+/**
+ * Slack mrkdwn escaping:
+ * - & < > must be escaped
+ * - also escape backticks to avoid codeblock breakage
+ */
+function escapeSlackMrkdwn(s) {
+    return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/`/g, "ˋ");
 }
 
 function sanitizeChannelName(name) {
@@ -308,7 +560,7 @@ function sanitizeChannelName(name) {
         .slice(0, 80);
 }
 
-function buildFilename(subject) {
+function buildEmlFilename(subject) {
     const safeSubject = (subject || "no-subject")
         .slice(0, 80)
         .replace(/[^a-z0-9]+/gi, "_")
@@ -318,61 +570,7 @@ function buildFilename(subject) {
     return `email-${Date.now()}-${safeSubject || "no_subject"}.eml`;
 }
 
-function safeJson(str, fallback) {
-    try {
-        return str ? JSON.parse(str) : fallback;
-    } catch {
-        return fallback;
-    }
-}
-
-async function getRawEmailBytes(message) {
-    const raw = message.raw;
-
-    if (raw instanceof Uint8Array) return raw;
-    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
-
-    if (raw && typeof raw.getReader === "function") {
-        const reader = raw.getReader();
-        const chunks = [];
-        let total = 0;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            total += value.byteLength;
-        }
-        const out = new Uint8Array(total);
-        let offset = 0;
-        for (const c of chunks) {
-            out.set(c, offset);
-            offset += c.byteLength;
-        }
-        return out;
-    }
-
-    if (typeof raw === "string") return new TextEncoder().encode(raw);
-
-    const ab = await new Response(raw).arrayBuffer();
-    return new Uint8Array(ab);
-}
-
-// ---------- text utilities ----------
-
-function clampSlackText(text, maxChars) {
-    const t = (text || "").trim();
-    if (!t) return "";
-    if (t.length <= maxChars) return escapeMrkdwn(t);
-    return escapeMrkdwn(t.slice(0, maxChars - 1)) + "…";
-}
-
-function escapeMrkdwn(s) {
-    // Minimal escaping; Slack mrkdwn is forgiving but these prevent weird formatting
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 function htmlToText(html) {
-    // Simple HTML -> text conversion (good enough for email previews)
     return String(html || "")
         .replace(/<style[\s\S]*?<\/style>/gi, "")
         .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -386,4 +584,19 @@ function htmlToText(html) {
         .replace(/&#39;/g, "'")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
+}
+
+function isRetryableSlackError(error) {
+    // Common transient errors; extend as needed
+    return new Set([
+        "ratelimited",
+        "timeout",
+        "internal_error",
+        "service_unavailable",
+        "fatal_error",
+    ]).has(String(error || "").toLowerCase());
+}
+
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
 }
