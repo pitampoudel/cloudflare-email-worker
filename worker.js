@@ -15,7 +15,10 @@ export default {
         let route = routes[rcpt];
         if (!route) {
             route = { type: "channel", name: FALLBACK_CHANNEL_NAME };
-            console.warn("No route found; using fallback channel", { rcpt, fallback: FALLBACK_CHANNEL_NAME });
+            console.warn("No route found; using fallback channel", {
+                rcpt,
+                fallback: FALLBACK_CHANNEL_NAME,
+            });
         }
 
         ctx.waitUntil(handleSlackForward(message, token, rcpt, route));
@@ -32,11 +35,14 @@ async function handleSlackForward(message, token, rcpt, route) {
                 console.error("Failed to open DM", { rcpt, user: route.user });
                 return;
             }
-
         } else if (route.type === "channel") {
             targetId = await resolveChannelTarget(token, route);
             if (!targetId) {
-                console.error("Failed to resolve channel target", { rcpt, route });
+                console.error(
+                    "Failed to resolve channel target. " +
+                    "If this is a private channel, invite the bot to the channel and/or set route.id (channel ID).",
+                    { rcpt, route }
+                );
                 return;
             }
         } else {
@@ -97,7 +103,7 @@ async function handleSlackForward(message, token, rcpt, route) {
 // ---------- NEW: channel target resolver ----------
 
 async function resolveChannelTarget(token, route) {
-    // If they still provide an ID, accept it
+    // If they provide an ID, accept it
     if (route.id && /^[CG][A-Z0-9]+$/.test(route.id)) return route.id;
 
     // Prefer name
@@ -150,6 +156,7 @@ async function findChannelByName(token, name) {
             return null;
         }
 
+        // NOTE: Slack will only return private channels the bot is a member of.
         const ch = (res.channels || []).find((c) => c?.name === name);
         if (ch?.id) return ch.id;
 
