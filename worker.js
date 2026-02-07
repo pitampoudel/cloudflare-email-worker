@@ -15,8 +15,6 @@ const SLACK_PREVIEW_LIMIT = 2500; // keep room for header/labels
 const SLACK_ATTACHMENTS_LIST_LIMIT = 10;
 
 const DEFAULT_OPTIONS = {
-    uploadTxtBody: true,
-    uploadRawEml: true,
     stripPlusAddressing: false, // set true if you want user+tag@domain.com → user@domain.com
     // If true, tries to create channels by name (requires perms). If false, only resolves existing.
     allowCreatePublicChannels: true,
@@ -101,23 +99,11 @@ async function handleSlackForward({ message, token, rcpt, route, options }) {
             // Continue; uploads can still succeed.
         }
 
-        // Upload full body as .txt (optional)
-        if (options.uploadTxtBody && bodyText?.trim()) {
-            const bodyFilename = `email-body-${Date.now()}.txt`;
-            const bodyBytes = new TextEncoder().encode(bodyText);
-
-            await uploadBytesToSlack(token, targetId, bodyFilename, bodyBytes, {
-                initial_comment: "Full email body (viewable in Slack):",
-            });
-        }
-
-        // Upload raw .eml archive (optional)
-        if (options.uploadRawEml) {
-            const emlFilename = buildEmlFilename(subject);
-            await uploadBytesToSlack(token, targetId, emlFilename, rawBytes, {
-                initial_comment: "Raw email archive (.eml):",
-            });
-        }
+        // Upload raw .eml archive
+        const emlFilename = buildEmlFilename(subject);
+        await uploadBytesToSlack(token, targetId, emlFilename, rawBytes, {
+            initial_comment: "Raw email archive (.eml):",
+        });
 
         console.log("email forwarded", { rcpt, targetId });
     } catch (e) {
@@ -386,8 +372,8 @@ function buildSlackBlocks({ toHeader, from, subject, bodyPreview, attachments })
         {
             type: "section",
             fields: [
-                { type: "mrkdwn", text: `*To:*\n${escapeSlackMrkdwn(toHeader)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
                 { type: "mrkdwn", text: `*From:*\n${escapeSlackMrkdwn(from)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
+                { type: "mrkdwn", text: `*To:*\n${escapeSlackMrkdwn(toHeader)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
                 { type: "mrkdwn", text: `*Subject:*\n${escapeSlackMrkdwn(subject)}`.slice(0, SLACK_BLOCK_TEXT_LIMIT) },
             ],
         },
