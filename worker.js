@@ -2,12 +2,7 @@
  * Cloudflare Email Worker → Slack
  * Simple: upload raw email (.eml) to Slack.
  *
- * Env:
- *  - SLACK_BOT_TOKEN
- *  - ROUTES_JSON (optional): {"rcpt@domain.com": {type:"channel", id:"C..." } | {type:"dm", user:"U..."} }
  */
-
-const FALLBACK_CHANNEL_ID = "C0123456789"; // <-- put your Slack channel ID here
 
 export default {
     async email(message, env, ctx) {
@@ -18,7 +13,12 @@ export default {
             const routes = safeJson(env.ROUTES_JSON, {});
             const rcpt = getPrimaryRecipient(message);
 
-            const route = normalizeRoute(routes?.[rcpt]) ?? { type: "channel", id: FALLBACK_CHANNEL_ID };
+            const fallbackChannelId = env.FALLBACK_CHANNEL_ID;
+            const route = normalizeRoute(routes?.[rcpt]) ?? buildFallbackRoute(fallbackChannelId);
+            if (!route) {
+                console.error("No valid Slack route or fallback channel configured; skipping");
+                return;
+            }
 
             ctx.waitUntil(forwardRawEmlToSlack(message, token, route));
         } catch (e) {
@@ -31,7 +31,10 @@ export default {
 async function forwardRawEmlToSlack(message, token, route) {
     try {
         const channelId = await resolveSlackTargetId(token, route);
-        if (!channelId) return;
+        if (!channelId) {
+            console.error("Unable to resolve Slack target", route);
+            return;
+        }
 
         const rawBytes = await getRawEmailBytes(message);
         if (!rawBytes?.byteLength) return;
@@ -55,7 +58,8 @@ async function resolveSlackTargetId(token, route) {
 
     if (route?.type === "channel") {
         // require channel ID for simplicity
-        return route.id && /^[CG][A-Z0-9]+$/.test(route.id) ? route.id : null;
+        if (!route.id || !/^[CG][A-Z0-9]+$/.test(route.id)) return null;
+        return route.id;
     }
 
     return null;
@@ -92,7 +96,11 @@ async function uploadBytesToSlack(token, channelId, filename, bytes) {
     });
 
     if (!completeRes.ok) {
-        console.error("files.completeUploadExternal failed:", completeRes);
+        if (completeRes.error === "channel_not_found") {
+            console.error("Slack channel not found or bot missing from channel", { channelId, completeRes });
+        } else {
+            console.error("files.completeUploadExternal failed:", completeRes);
+        }
         return false;
     }
 
@@ -148,6 +156,11 @@ function normalizeRoute(route) {
     if (type === "channel" && route.id) return { type: "channel", id: String(route.id) };
 
     return null;
+}
+
+function buildFallbackRoute(fallbackChannelId) {
+    if (!fallbackChannelId) return null;
+    return { type: "channel", id: String(fallbackChannelId) };
 }
 
 function safeJson(str, fallback) {

@@ -14,6 +14,12 @@ npx wrangler secret put SLACK_BOT_TOKEN
 ```
 Enter your Slack bot token when prompted.
 
+#### Set Fallback Slack Channel ID (Variable)
+```bash
+npx wrangler secret put FALLBACK_CHANNEL_ID
+```
+Use the channel ID the bot is invited to (not a name like #support).
+
 #### Set Email Routing Configuration
 ```bash
 npx wrangler secret put ROUTES_JSON
@@ -23,6 +29,7 @@ Enter your routing JSON when prompted (see example below).
 Alternatively, you can set these variables in the Cloudflare dashboard:
 - Go to Workers & Pages > Your Worker > Settings > Variables
 - Add `SLACK_BOT_TOKEN` as an encrypted variable
+- Add `FALLBACK_CHANNEL_ID` as an encrypted variable
 - Add `ROUTES_JSON` as an encrypted variable
 
 ### 2. Deploy
@@ -47,5 +54,3 @@ The wrangler.toml file ensures your environment variables are preserved across d
   }
 }
 ```
-
-
