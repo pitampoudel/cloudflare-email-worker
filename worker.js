@@ -20,7 +20,7 @@ export default {
 
         for (const target of targets) {
             try {
-                message.forward(target);
+                await message.forward(target);
             } catch (firstError) {
                 console.error("Forwarding failed with original from", {
                     target,
@@ -42,7 +42,7 @@ export default {
                     const rewrittenHeaders = new Headers();
                     rewrittenHeaders.set("From", rewrittenFrom);
                     rewrittenHeaders.set("Reply-To", message.from);
-                    message.forward(target, rewrittenHeaders);
+                    await message.forward(target, rewrittenHeaders);
                 } catch (retryError) {
                     console.error("Forwarding failed with modified from", {
                         target,
