@@ -129,20 +129,24 @@ async function sendViaSmtp(forwardTo, rawBytes, env) {
 
     // Try MailChannels API first (free for Cloudflare Workers, host = "api.mailchannels.net")
     if (smtpHost === "api.mailchannels.net") {
+        const mcPayload = {
+            personalizations: [{ to: [{ email: forwardTo }] }],
+            from: { email: smtpFrom },
+            subject: payload.subject,
+            content: [
+                ...(payload.text ? [{ type: "text/plain", value: payload.text }] : []),
+                ...(payload.html ? [{ type: "text/html", value: payload.html }] : []),
+            ],
+        };
+        if (payload.attachments?.length) {
+            mcPayload.attachments = payload.attachments;
+        }
         const res = await fetch("https://api.mailchannels.net/tx/v1/send", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                personalizations: [{ to: [{ email: forwardTo }] }],
-                from: { email: smtpFrom },
-                subject: payload.subject,
-                content: [
-                    ...(payload.text ? [{ type: "text/plain", value: payload.text }] : []),
-                    ...(payload.html ? [{ type: "text/html", value: payload.html }] : []),
-                ],
-            }),
+            body: JSON.stringify(mcPayload),
         });
-        if (res.ok || res.status === 202) {
+        if (res.ok) {
             console.log("Email sent via MailChannels", { forwardTo });
             return;
         }
@@ -151,6 +155,7 @@ async function sendViaSmtp(forwardTo, rawBytes, env) {
     }
 
     // Generic SMTP HTTP relay (e.g., SendGrid, Mailgun, or custom SMTP-to-HTTP bridge)
+    // Expects a POST https://<SMTP_HOST>:<SMTP_PORT>/send endpoint accepting JSON payload
     const authHeader = smtpUsername && smtpPassword
         ? { Authorization: "Basic " + btoa(`${smtpUsername}:${smtpPassword}`) }
         : {};
@@ -173,11 +178,13 @@ async function sendViaSmtp(forwardTo, rawBytes, env) {
 }
 
 function uint8ArrayToBase64(bytes) {
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    const chunkSize = 8192;
+    const parts = [];
+    for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        parts.push(String.fromCharCode(...chunk));
     }
-    return btoa(binary);
+    return btoa(parts.join(""));
 }
 
 /* -------------------- Slack target resolution (channel / dm) -------------------- */
