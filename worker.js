@@ -24,11 +24,10 @@ export default {
                 await message.forward(target);
             } catch (error) {
                 hadForwardFailure = true;
-                const rewrittenHeaders = new Headers();
-                rewrittenHeaders.set("From", routes.forwarder);
-                rewrittenHeaders.set("Reply-To", message.from);
-
                 try {
+                    const rewrittenHeaders = new Headers();
+                    rewrittenHeaders.set("From", routes.forwarder);
+                    rewrittenHeaders.set("Reply-To", message.from);
                     await message.forward(target, rewrittenHeaders);
                 } catch (retryError) {
                     console.error("Forwarding failed", {
@@ -73,12 +72,20 @@ async function notifySlack(message, routeConfig, token) {
 }
 
 function resolveRouteConfig(routes, toAddress) {
+    if (!routes || typeof routes !== "object") {
+        return null;
+    }
+
+    const normalizedTo = normalizeAddress(toAddress);
     for (const [key, value] of Object.entries(routes)) {
-        if (key === toAddress) {
+        if (key === "fallback") {
+            continue;
+        }
+        if (normalizeAddress(key) === normalizedTo) {
             return value;
         }
     }
-    return routes.fallback;
+    return routes.fallback || null;
 }
 
 async function resolveSlackTarget(routeConfig, token) {
@@ -104,6 +111,20 @@ function safeJson(str, fallback) {
     } catch {
         return fallback;
     }
+}
+
+function normalizeAddress(address) {
+    return `${address || ""}`.trim().toLowerCase();
+}
+
+function normalizeError(error) {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+        };
+    }
+    return {message: `${error}`};
 }
 
 async function slackPost(token, endpoint, payload) {
