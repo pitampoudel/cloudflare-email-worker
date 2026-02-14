@@ -49,7 +49,7 @@ export default {
                         retryError: normalizeError(retryError),
                         from: rewrittenFrom
                     });
-                    message.setReject("Unable to forward this email");
+                    message.setReject(`Unable to forward this email. Direct forward error: ${firstError.message} | Modified forward error: ${retryError.message}`);
                     return;
                 }
             }
