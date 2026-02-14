@@ -1,26 +1,58 @@
+import {EmailMessage} from "cloudflare:email";
+
 export default {
     async email(message, env, ctx) {
+
         const routes = safeJson(env.ROUTES_JSON, {});
         let routeConfig = routes[message.to];
         if (!routeConfig) {
             routeConfig = routes["fallback"];
         }
-        const forwardTo = routeConfig?.forwardTo;
+        const forwardToTargets = routeConfig?.forwardTo;
 
-        if (forwardTo == null) message.setReject("Unknown address");
+        if (!forwardToTargets || forwardTargets.length === 0) message.setReject("Unknown addresses");
 
-        await fetch("https://webhook.slack/notification", {
-            body: `Got an email from ${message.from}, subject: ${message.headers.get('subject')}`,
-        });
+
+        if (env.SLACK_BOT_TOKEN && routeConfig.slack) {
+            ctx.waitUntil(slackPost(env.SLACK_BOT_TOKEN, "chat.postMessage", {
+                channel: resolveSlackTarget(routeConfig, env.SLACK_BOT_TOKEN),
+                "text": `Got an email from ${message.from}, subject: ${message.headers.get('subject')}`
+            }));
+        }
+
         try {
             message.forward(forwardTo);
 
         } catch (e) {
             // send using different from address
+
+
+            // if still fails, reject the message
+            message.setReject("Unable to forward this email");
+
         }
 
+    },
+};
+
+
+async function resolveSlackTarget(routeConfig, token) {
+    const slack = routeConfig.slack;
+    if (!slack) {
+        return null;
     }
+    const type = routeConfig.type;
+    if (type !== "dm" || slack.startsWith("D")) {
+        return slack;
+    }
+
+    const opened = await slackPost(token, "conversations.open", {users: slack});
+    if (!opened.ok) {
+        throw new Error(`conversations.open failed: ${opened.error || "unknown_error"}`);
+    }
+    return opened.channel?.id;
 }
+
 
 function safeJson(str, fallback) {
     try {
@@ -30,22 +62,26 @@ function safeJson(str, fallback) {
     }
 }
 
-
-async function slackApiForm(token, method, fields) {
-    const url = `https://slack.com/api/${method}`;
-    const form = new FormData();
-    for (const [k, v] of Object.entries(fields)) form.append(k, v);
-
-    const res = await fetch(url, {
+async function slackPost(token, endpoint, payload) {
+    const response = await fetch(`https://slack.com/api/${endpoint}`, {
         method: "POST",
-        headers: {Authorization: `Bearer ${token}`},
-        body: form,
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify(payload),
     });
-
-    const text = await res.text();
+    const text = await response.text();
+    let parsed;
     try {
-        return JSON.parse(text);
+        parsed = JSON.parse(text);
     } catch {
-        return {ok: false, error: "non_json_response", httpStatus: res.status, body: text.slice(0, 300)};
+        parsed = {ok: false, error: "non_json_response"};
     }
+
+    if (!response.ok && parsed.ok !== false) {
+        parsed.ok = false;
+        parsed.error = `http_${response.status}`;
+    }
+    return parsed;
 }
